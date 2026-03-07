@@ -11,6 +11,12 @@ const { loadStore, saveStore } = require("./panelStore");
 
 const WELCOME_CHANNEL_NAME = "환영합니다";
 const COMMAND_PREFIX = "!패널";
+const PANEL_HEADER_NAMES = {
+    언어선택: "[========= Languages =========]",
+    분야선택: "[=========== Fields ============]",
+    기술선택: "[===== Framework & Libraries =====]",
+    활동선택: "[========= Activities =========]",
+};
 
 let store = {
     panels: {},
@@ -51,7 +57,12 @@ client.on(Events.MessageCreate, async (message) => {
         return;
     }
 
-    if (!message.content.includes(COMMAND_PREFIX)) {
+    const commandLines = message.content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith(COMMAND_PREFIX));
+
+    if (commandLines.length === 0) {
         return;
     }
 
@@ -63,7 +74,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     try {
-        await handlePanelCommands(message);
+        await handlePanelCommands(message, commandLines);
     } catch (error) {
         console.error("패널 명령 처리 실패:", error);
         await respond(
@@ -85,12 +96,7 @@ client.on(Events.Error, (error) => {
     console.error("Discord client error:", error);
 });
 
-async function handlePanelCommands(message) {
-    const lines = message.content
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith(COMMAND_PREFIX));
-
+async function handlePanelCommands(message, lines) {
     for (const line of lines) {
         await handlePanelCommand(message, line);
     }
@@ -110,6 +116,9 @@ async function handlePanelCommand(message, rawCommand) {
     switch (action) {
         case "생성":
             await createPanel(message, rest);
+            return;
+        case "헤더":
+            await explainManagedHeader(message, rest);
             return;
         case "설명":
             await updatePanelDescription(message, rest);
@@ -161,6 +170,30 @@ async function createPanel(message, panelName) {
     );
 }
 
+async function explainManagedHeader(message, rest) {
+    const [panelName] = splitByPipe(rest, 2);
+    if (!panelName) {
+        await respond(message, "사용법: `!패널 헤더 패널이름 | 헤더역할명`");
+        return;
+    }
+
+    const panel = getPanel(message.guild.id, panelName);
+    if (!panel) {
+        await respond(message, "해당 패널을 찾을 수 없습니다.");
+        return;
+    }
+
+    await respond(
+        message,
+        [
+            `패널 \`${panelName}\` 헤더는 이제 데이터에 저장하지 않고 코드 규칙으로 관리합니다.`,
+            getPanelHeaderName(panelName)
+                ? `현재 적용 헤더: \`${getPanelHeaderName(panelName)}\``
+                : "이 패널은 자동 헤더 대상이 아닙니다.",
+        ].join("\n")
+    );
+}
+
 async function updatePanelDescription(message, rest) {
     const [panelName, description] = splitByPipe(rest, 2);
     if (!panelName || !description) {
@@ -195,7 +228,11 @@ async function addPanelItem(message, rest) {
         return;
     }
 
-    const { role, created } = await resolveOrCreateRole(message, roleInput);
+    const role = resolveRole(message, roleInput);
+    if (!role) {
+        await respond(message, buildRoleNotFoundMessage(message, roleInput));
+        return;
+    }
 
     const emoji = resolveEmoji(message.guild, emojiInput);
     if (!emoji) {
@@ -222,14 +259,9 @@ async function addPanelItem(message, rest) {
     await persistStore();
     await respond(
         message,
-        [
-            created ? `역할 \`${role.name}\` 을(를) 새로 생성했습니다.` : null,
-            `패널 \`${panelName}\`에 \`${role.name}\` 역할과 ${formatEmojiLabel(
-                emoji
-            )} 이모지를 연결했습니다.`,
-        ]
-            .filter(Boolean)
-            .join("\n")
+        `패널 \`${panelName}\`에 \`${role.name}\` 역할과 ${formatEmojiLabel(
+            emoji
+        )} 이모지를 연결했습니다.`
     );
 }
 
@@ -393,13 +425,32 @@ async function handleReactionRole(reaction, user, action) {
             return;
         }
 
+        const headerRole = await ensurePanelHeaderRole(message.guild, panel);
+
         if (action === "add" && !member.roles.cache.has(role.id)) {
             await member.roles.add(role);
+        }
+
+        if (action === "add" && headerRole && !member.roles.cache.has(headerRole.id)) {
+            await member.roles.add(headerRole);
         }
 
         if (action === "remove" && member.roles.cache.has(role.id)) {
             await member.roles.remove(role);
         }
+
+        if (action === "remove" && headerRole) {
+            const remainingRoleIds = new Set(member.roles.cache.keys());
+            remainingRoleIds.delete(role.id);
+            const hasAnyPanelRole = panel.items.some((item) =>
+                remainingRoleIds.has(item.roleId)
+            );
+
+            if (!hasAnyPanelRole && member.roles.cache.has(headerRole.id)) {
+                await member.roles.remove(headerRole);
+            }
+        }
+
     } catch (error) {
         console.error("역할 반응 처리 실패:", error);
     }
@@ -438,23 +489,24 @@ function resolveRole(message, input) {
     );
 }
 
-async function resolveOrCreateRole(message, input) {
-    const existingRole = resolveRole(message, input);
-    if (existingRole) {
-        return { role: existingRole, created: false };
+async function ensurePanelHeaderRole(guild, panel) {
+    const headerRoleName = getPanelHeaderName(panel.name);
+    if (!headerRoleName) {
+        sanitizeLegacyHeaderFields(panel);
+        return null;
     }
 
-    const roleName = normalizeRoleInput(input);
-    if (!roleName) {
-        throw new Error("역할 이름이 비어 있습니다.");
-    }
+    const role =
+        guild.roles.cache.find((item) => item.name === headerRoleName) ||
+        (panel.headerRoleId
+            ? await guild.roles.fetch(panel.headerRoleId).catch(() => null)
+            : null) ||
+        (panel.headerRoleName
+            ? guild.roles.cache.find((item) => item.name === panel.headerRoleName)
+            : null);
 
-    const createdRole = await message.guild.roles.create({
-        name: roleName,
-        reason: "Daora Assistant 패널 역할 자동 생성",
-    });
-
-    return { role: createdRole, created: true };
+    sanitizeLegacyHeaderFields(panel);
+    return role;
 }
 
 function resolveChannel(message, input) {
@@ -512,7 +564,9 @@ function renderPanel(panel, guild) {
             const roleName = guild.roles.cache.get(item.roleId)?.name || item.roleName;
             return `${roleName} (${formatEmojiLabel(item.emoji)})`;
         }),
-    ].join("\n");
+    ]
+        .filter(Boolean)
+        .join("\n");
 }
 
 function splitByPipe(input, expectedParts) {
@@ -561,6 +615,7 @@ function getHelpMessage() {
     return [
         "패널 명령어:",
         "- `!패널 생성 패널이름`",
+        "- `!패널 헤더 패널이름`",
         "- `!패널 설명 패널이름 | 설명`",
         "- `!패널 추가 패널이름 | @역할 또는 역할명 | 이모지`",
         "- `!패널 제거 패널이름 | @역할 또는 역할명`",
@@ -570,10 +625,11 @@ function getHelpMessage() {
         "- `!패널 삭제 패널이름`",
         "",
         "예시:",
-        "- `!패널 생성 언어역할`",
-        "- `!패널 설명 언어역할 | 여러분이 주로 사용하는 언어를 골라주세요!`",
-        "- `!패널 추가 언어역할 | @Python | <:python:123456789012345678>`",
-        "- `!패널 발행 언어역할 | #역할받기`",
+        "- `!패널 생성 언어선택`",
+        "- `!패널 헤더 언어선택`",
+        "- `!패널 설명 언어선택 | 여러분이 주로 사용하는 언어를 골라주세요!`",
+        "- `!패널 추가 언어선택 | @Python | <:python:123456789012345678>`",
+        "- `!패널 발행 언어선택 | #역할선택`",
     ].join("\n");
 }
 
@@ -583,6 +639,15 @@ async function respond(message, content) {
 
 function normalizeRoleInput(value) {
     return value.replace(/^@+/, "").trim();
+}
+
+function getPanelHeaderName(panelName) {
+    return PANEL_HEADER_NAMES[panelName] || null;
+}
+
+function sanitizeLegacyHeaderFields(panel) {
+    delete panel.headerRoleId;
+    delete panel.headerRoleName;
 }
 
 function buildRoleNotFoundMessage(message, roleInput) {
