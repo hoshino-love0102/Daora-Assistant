@@ -371,8 +371,13 @@ async function registerPublishedMessageFromContent(message) {
 
 function parsePanelNameFromContent(content) {
     const firstLine = content?.split("\n")[0]?.trim();
-    const match = firstLine?.match(/^<(.+)>$/);
-    return match?.[1] || null;
+    const legacyMatch = firstLine?.match(/^<(.+)>$/);
+    if (legacyMatch) {
+        return legacyMatch[1];
+    }
+
+    const headingMatch = firstLine?.match(/^#{1,3}\s+(.+)$/);
+    return headingMatch ? stripMarkdownDecorations(headingMatch[1]) : null;
 }
 
 async function cleanupMemberReactions(member) {
@@ -644,17 +649,21 @@ async function ensurePanelHeaderRole(guild, panel) {
 
 function renderPanel(panel, guild) {
     return [
-        `<${panel.name}>`,
+        `## __${panel.name}__`,
         panel.description,
         "",
         ...panel.items.map((item) => {
             const roleName =
                 guild.roles.cache.get(item.roleId)?.name || item.roleName;
-            return `${roleName} (${formatEmojiLabel(item.emoji)})`;
+            return `- ${roleName} (${formatEmojiLabel(item.emoji)})`;
         }),
     ]
         .filter(Boolean)
         .join("\n");
+}
+
+function stripMarkdownDecorations(value) {
+    return value.replace(/[*_`~]/g, "").trim();
 }
 
 function getHelpMessage() {
