@@ -291,7 +291,9 @@ async function handleReactionRole(reaction, user, action) {
 
         const fullReaction = reaction.partial ? await reaction.fetch() : reaction;
         const { message } = fullReaction;
-        const published = getPublishedMessage(message.id);
+        const published =
+            getPublishedMessage(message.id) ||
+            (await registerPublishedMessageFromContent(message));
 
         if (!published || published.guildId !== message.guild?.id) {
             return;
@@ -317,12 +319,12 @@ async function handleReactionRole(reaction, user, action) {
 
         const headerRole = await ensurePanelHeaderRole(message.guild, panel);
 
-        if (action === "add" && !member.roles.cache.has(role.id)) {
-            await member.roles.add(role);
+        if (action === "add") {
+            await addRoleIfMissing(member, role, "역할 부여 실패");
         }
 
         if (action === "add" && headerRole && !member.roles.cache.has(headerRole.id)) {
-            await member.roles.add(headerRole);
+            await addRoleIfMissing(member, headerRole, "헤더 역할 부여 실패");
         }
 
         if (action === "remove" && member.roles.cache.has(role.id)) {
@@ -343,6 +345,34 @@ async function handleReactionRole(reaction, user, action) {
     } catch (error) {
         console.error("역할 반응 처리 실패:", error);
     }
+}
+
+async function registerPublishedMessageFromContent(message) {
+    const panelName = parsePanelNameFromContent(message.content);
+    if (!panelName || !message.guild) {
+        return null;
+    }
+
+    const panel = getPanel(message.guild.id, panelName);
+    if (!panel) {
+        return null;
+    }
+
+    const published = {
+        guildId: message.guild.id,
+        channelId: message.channel.id,
+        panelName: panel.name,
+    };
+
+    setPublishedMessage(message.id, published);
+    await persistStore();
+    return published;
+}
+
+function parsePanelNameFromContent(content) {
+    const firstLine = content?.split("\n")[0]?.trim();
+    const match = firstLine?.match(/^<(.+)>$/);
+    return match?.[1] || null;
 }
 
 async function cleanupMemberReactions(member) {
@@ -482,24 +512,21 @@ async function cleanupDepartedMemberReactions(roleMessage, panel) {
 
 async function reconcileReactionRoles(roleMessage, panel) {
     const headerRole = await ensurePanelHeaderRole(roleMessage.guild, panel);
+    const roleUsers = new Map();
 
     for (const item of panel.items) {
         const reaction = findReactionForItem(roleMessage, item);
-        if (!reaction) {
-            continue;
-        }
-
         const role = await roleMessage.guild.roles.fetch(item.roleId);
         if (!role) {
             continue;
         }
 
-        const users = await fetchReactionUsers(reaction).catch(() => null);
-        if (!users) {
-            continue;
-        }
+        const users = reaction
+            ? await fetchReactionUsers(reaction).catch(() => null)
+            : new Map();
+        roleUsers.set(role.id, users || new Map());
 
-        for (const user of users.values()) {
+        for (const user of roleUsers.get(role.id).values()) {
             if (user.bot) {
                 continue;
             }
@@ -511,19 +538,54 @@ async function reconcileReactionRoles(roleMessage, panel) {
                 continue;
             }
 
-            if (!member.roles.cache.has(role.id)) {
-                await member.roles.add(role).catch((error) => {
-                    console.error("역할 보정 실패:", error);
-                });
-            }
+            await addRoleIfMissing(member, role, "역할 보정 실패");
 
             if (headerRole && !member.roles.cache.has(headerRole.id)) {
-                await member.roles.add(headerRole).catch((error) => {
-                    console.error("헤더 역할 보정 실패:", error);
+                await addRoleIfMissing(member, headerRole, "헤더 역할 보정 실패");
+            }
+        }
+    }
+
+    await roleMessage.guild.members.fetch().catch(() => null);
+
+    for (const item of panel.items) {
+        const role = await roleMessage.guild.roles.fetch(item.roleId);
+        if (!role) {
+            continue;
+        }
+
+        const reactedUsers = roleUsers.get(role.id) || new Map();
+        for (const member of role.members.values()) {
+            if (!reactedUsers.has(member.id)) {
+                await member.roles.remove(role).catch((error) => {
+                    console.error("역할 제거 보정 실패:", error);
                 });
             }
         }
     }
+
+    if (headerRole) {
+        for (const member of headerRole.members.values()) {
+            const hasAnyPanelRole = panel.items.some((item) =>
+                member.roles.cache.has(item.roleId)
+            );
+            if (!hasAnyPanelRole) {
+                await member.roles.remove(headerRole).catch((error) => {
+                    console.error("헤더 역할 제거 보정 실패:", error);
+                });
+            }
+        }
+    }
+}
+
+async function addRoleIfMissing(member, role, errorMessage) {
+    if (member.roles.cache.has(role.id)) {
+        return;
+    }
+
+    await member.roles.add(role).catch((error) => {
+        console.error(errorMessage, error);
+    });
 }
 
 function findReactionForItem(roleMessage, item) {
