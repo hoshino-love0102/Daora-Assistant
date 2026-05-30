@@ -30,8 +30,34 @@ function getPublishedMessage(messageId) {
     return store.publishedMessages[messageId];
 }
 
+function getPublishedPanelMessages(guildId, panelName) {
+    return Object.entries(store.publishedMessages)
+        .filter(
+            ([, value]) =>
+                value.guildId === guildId && value.panelName === panelName
+        )
+        .map(([messageId, value]) => ({
+            messageId,
+            ...value,
+        }))
+        .sort((a, b) => {
+            const left = BigInt(a.messageId);
+            const right = BigInt(b.messageId);
+
+            if (right === left) {
+                return 0;
+            }
+
+            return right > left ? 1 : -1;
+        });
+}
+
 function setPublishedMessage(messageId, value) {
     store.publishedMessages[messageId] = value;
+}
+
+function removePublishedMessage(messageId) {
+    delete store.publishedMessages[messageId];
 }
 
 async function persistStore() {
@@ -41,9 +67,11 @@ async function persistStore() {
 module.exports = {
     getGuildPanels,
     getPanel,
+    getPublishedPanelMessages,
     getPublishedMessage,
     getStore,
     initializeStore,
     persistStore,
+    removePublishedMessage,
     setPublishedMessage,
 };

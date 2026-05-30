@@ -9,7 +9,10 @@ const {
 const { COMMAND_PREFIX } = require("./config/constants");
 const { handlePanelCommands } = require("./handlers/panelCommands");
 const { handleGuildMemberAdd } = require("./handlers/welcome");
-const { handleReactionRole } = require("./services/panelService");
+const {
+    cleanupMemberReactions,
+    handleReactionRole,
+} = require("./services/panelService");
 const { initializeStore } = require("./store/runtimeStore");
 const { respond } = require("./utils/discord");
 
@@ -22,7 +25,7 @@ const client = new Client({
         GatewayIntentBits.GuildEmojisAndStickers,
         GatewayIntentBits.MessageContent,
     ],
-    partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
 });
 
 client.once(Events.ClientReady, async () => {
@@ -31,6 +34,8 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.on(Events.GuildMemberAdd, handleGuildMemberAdd);
+
+client.on(Events.GuildMemberRemove, cleanupMemberReactions);
 
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot || !message.guild) {

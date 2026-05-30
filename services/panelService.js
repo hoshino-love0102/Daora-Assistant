@@ -2,8 +2,11 @@ const { PANEL_HEADER_NAMES } = require("../config/constants");
 const {
     getGuildPanels,
     getPanel,
+    getPublishedPanelMessages,
     getPublishedMessage,
+    getStore,
     persistStore,
+    removePublishedMessage,
     setPublishedMessage,
 } = require("../store/runtimeStore");
 const {
@@ -219,30 +222,46 @@ async function publishPanel(message, rest) {
         return;
     }
 
-    const targetChannel = resolveChannel(message, channelInput) || message.channel;
+    const targetChannel =
+        resolveChannel(message, channelInput) ||
+        (await findLatestPublishedChannel(message.guild, panel)) ||
+        message.channel;
     if (!targetChannel.isTextBased()) {
         await respond(message, "발행 대상은 텍스트 채널이어야 합니다.");
         return;
     }
 
-    const roleMessage = await targetChannel.send({
-        content: renderPanel(panel, message.guild),
-    });
+    const existingPublished = await findReusablePublishedMessage(
+        message.guild,
+        panel,
+        targetChannel
+    );
+    const panelContent = renderPanel(panel, message.guild);
+    const roleMessage = existingPublished
+        ? await existingPublished.message.edit({ content: panelContent })
+        : await targetChannel.send({ content: panelContent });
 
-    for (const item of panel.items) {
-        await roleMessage.react(getReactionIdentifier(item.emoji));
-    }
+    await syncPanelReactions(roleMessage, panel);
+    await pruneStalePublishedMessages(
+        message.guild.id,
+        panel.name,
+        roleMessage.id
+    );
+    await cleanupDepartedMemberReactions(roleMessage, panel);
+    await reconcileReactionRoles(roleMessage, panel);
 
     setPublishedMessage(roleMessage.id, {
         guildId: message.guild.id,
-        channelId: targetChannel.id,
+        channelId: roleMessage.channel.id,
         panelName: panel.name,
     });
     await persistStore();
 
     await respond(
         message,
-        `패널 \`${panel.name}\` 을(를) ${targetChannel} 채널에 발행했습니다.`
+        existingPublished
+            ? `패널 \`${panel.name}\` 기존 메시지를 수정했습니다.`
+            : `패널 \`${panel.name}\` 을(를) ${targetChannel} 채널에 발행했습니다.`
     );
 }
 
@@ -264,11 +283,12 @@ async function deletePanel(message, panelName) {
 }
 
 async function handleReactionRole(reaction, user, action) {
-    if (user.bot) {
-        return;
-    }
-
     try {
+        const fullUser = user.partial ? await user.fetch() : user;
+        if (fullUser.bot) {
+            return;
+        }
+
         const fullReaction = reaction.partial ? await reaction.fetch() : reaction;
         const { message } = fullReaction;
         const published = getPublishedMessage(message.id);
@@ -289,7 +309,7 @@ async function handleReactionRole(reaction, user, action) {
             return;
         }
 
-        const member = await message.guild.members.fetch(user.id);
+        const member = await message.guild.members.fetch(fullUser.id);
         const role = await message.guild.roles.fetch(matchedItem.roleId);
         if (!role) {
             return;
@@ -323,6 +343,221 @@ async function handleReactionRole(reaction, user, action) {
     } catch (error) {
         console.error("역할 반응 처리 실패:", error);
     }
+}
+
+async function cleanupMemberReactions(member) {
+    const publishedMessages = Object.entries(getStore().publishedMessages).filter(
+        ([, published]) => published.guildId === member.guild.id
+    );
+
+    for (const [messageId, published] of publishedMessages) {
+        try {
+            const channel = await member.guild.channels.fetch(published.channelId);
+            if (!channel?.isTextBased()) {
+                continue;
+            }
+
+            const roleMessage = await channel.messages.fetch(messageId);
+            for (const reaction of roleMessage.reactions.cache.values()) {
+                await reaction.users.remove(member.id).catch(() => null);
+            }
+        } catch (error) {
+            console.error("퇴장 멤버 반응 정리 실패:", error);
+        }
+    }
+}
+
+async function findLatestPublishedChannel(guild, panel) {
+    const candidates = getPublishedPanelMessages(guild.id, panel.name);
+
+    for (const published of candidates) {
+        try {
+            const channel = await guild.channels.fetch(published.channelId);
+            if (channel?.isTextBased()) {
+                return channel;
+            }
+        } catch {
+            removePublishedMessage(published.messageId);
+        }
+    }
+
+    return null;
+}
+
+async function findReusablePublishedMessage(guild, panel, targetChannel) {
+    const candidates = getPublishedPanelMessages(guild.id, panel.name);
+
+    for (const published of candidates) {
+        if (published.channelId !== targetChannel.id) {
+            continue;
+        }
+
+        const message = await fetchPublishedRoleMessage(guild, published);
+        if (message) {
+            return { published, message };
+        }
+
+        removePublishedMessage(published.messageId);
+    }
+
+    return null;
+}
+
+async function fetchPublishedRoleMessage(guild, published) {
+    try {
+        const channel = await guild.channels.fetch(published.channelId);
+        if (!channel?.isTextBased()) {
+            return null;
+        }
+
+        return await channel.messages.fetch(published.messageId);
+    } catch {
+        return null;
+    }
+}
+
+async function pruneStalePublishedMessages(guildId, panelName, activeMessageId) {
+    const staleMessages = getPublishedPanelMessages(guildId, panelName).filter(
+        (published) => published.messageId !== activeMessageId
+    );
+
+    for (const published of staleMessages) {
+        removePublishedMessage(published.messageId);
+    }
+}
+
+async function syncPanelReactions(roleMessage, panel) {
+    const configuredReactionIds = new Set(
+        panel.items.map((item) => getReactionIdentifier(item.emoji))
+    );
+
+    for (const reaction of roleMessage.reactions.cache.values()) {
+        if (!configuredReactionIds.has(getReactionCacheKey(reaction))) {
+            await reaction.remove().catch(() => null);
+        }
+    }
+
+    for (const item of panel.items) {
+        const reactionId = getReactionIdentifier(item.emoji);
+        const hasReaction = roleMessage.reactions.cache.some(
+            (reaction) => getReactionCacheKey(reaction) === reactionId
+        );
+
+        if (!hasReaction) {
+            await roleMessage.react(reactionId);
+        }
+    }
+}
+
+async function cleanupDepartedMemberReactions(roleMessage, panel) {
+    const configuredEmojis = new Set(panel.items.map((item) => item.emoji));
+
+    for (const reaction of roleMessage.reactions.cache.values()) {
+        const isPanelReaction = [...configuredEmojis].some((emoji) =>
+            matchesEmoji(emoji, reaction.emoji)
+        );
+        if (!isPanelReaction) {
+            continue;
+        }
+
+        const users = await fetchReactionUsers(reaction).catch(() => null);
+        if (!users) {
+            continue;
+        }
+
+        for (const user of users.values()) {
+            if (user.bot) {
+                continue;
+            }
+
+            const member = await roleMessage.guild.members
+                .fetch(user.id)
+                .catch(() => null);
+            if (!member) {
+                await reaction.users.remove(user.id).catch(() => null);
+            }
+        }
+    }
+}
+
+async function reconcileReactionRoles(roleMessage, panel) {
+    const headerRole = await ensurePanelHeaderRole(roleMessage.guild, panel);
+
+    for (const item of panel.items) {
+        const reaction = findReactionForItem(roleMessage, item);
+        if (!reaction) {
+            continue;
+        }
+
+        const role = await roleMessage.guild.roles.fetch(item.roleId);
+        if (!role) {
+            continue;
+        }
+
+        const users = await fetchReactionUsers(reaction).catch(() => null);
+        if (!users) {
+            continue;
+        }
+
+        for (const user of users.values()) {
+            if (user.bot) {
+                continue;
+            }
+
+            const member = await roleMessage.guild.members
+                .fetch(user.id)
+                .catch(() => null);
+            if (!member) {
+                continue;
+            }
+
+            if (!member.roles.cache.has(role.id)) {
+                await member.roles.add(role).catch((error) => {
+                    console.error("역할 보정 실패:", error);
+                });
+            }
+
+            if (headerRole && !member.roles.cache.has(headerRole.id)) {
+                await member.roles.add(headerRole).catch((error) => {
+                    console.error("헤더 역할 보정 실패:", error);
+                });
+            }
+        }
+    }
+}
+
+function findReactionForItem(roleMessage, item) {
+    return roleMessage.reactions.cache.find((reaction) =>
+        matchesEmoji(item.emoji, reaction.emoji)
+    );
+}
+
+async function fetchReactionUsers(reaction) {
+    const users = new Map();
+    let after;
+
+    while (true) {
+        const fetched = await reaction.users.fetch({
+            limit: 100,
+            after,
+        });
+
+        for (const [userId, user] of fetched) {
+            users.set(userId, user);
+        }
+
+        if (fetched.size < 100) {
+            break;
+        }
+
+        after = fetched.lastKey();
+    }
+
+    return users;
+}
+
+function getReactionCacheKey(reaction) {
+    return reaction.emoji.id || reaction.emoji.name;
 }
 
 async function ensurePanelHeaderRole(guild, panel) {
@@ -421,6 +656,7 @@ module.exports = {
     explainManagedHeader,
     getHelpMessage,
     handleReactionRole,
+    cleanupMemberReactions,
     listPanels,
     previewPanel,
     publishPanel,
